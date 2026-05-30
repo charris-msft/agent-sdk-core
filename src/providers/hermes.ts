@@ -30,6 +30,17 @@ export interface HermesProviderOptions {
   env?: NodeJS.ProcessEnv;
   /** Timeout for ACP initialize/session requests */
   requestTimeoutMs?: number;
+  /**
+   * Max attempts for a single prompt turn when Hermes masks a transient Codex
+   * transport failure (e.g. "API call failed after N retries") as a normal
+   * `end_turn`. Minimum 1 (no retry). Default 3. Env: HERMES_PROMPT_RETRIES.
+   */
+  promptRetryAttempts?: number;
+  /**
+   * Base backoff in ms between transient-failure retries; grows exponentially,
+   * capped. Default 2000. Env: HERMES_PROMPT_RETRY_BACKOFF_MS.
+   */
+  promptRetryBackoffMs?: number;
 }
 
 type SpawnedHermesProcess = Pick<ChildProcessWithoutNullStreams, 'stdin' | 'stdout' | 'stderr' | 'kill'> & {
@@ -70,12 +81,35 @@ interface RegisteredSession {
   destroyed: boolean;
   aborted: boolean;
   inFlightPrompt?: Promise<AgentResult>;
+  /** Bounded tail of the current turn's agent-message text, for transient-failure detection. */
+  turnText: string;
+  /** Whether the current turn emitted a <task-summary> sentinel tag (suppresses false retries). */
+  sawSummaryTag: boolean;
 }
 
 const HERMES_PROTOCOL_VERSION = 1;
 const CLIENT_VERSION = '0.4.1';
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 const PROMPT_REQUEST_TIMEOUT_MS = 0;
+const DEFAULT_PROMPT_RETRY_ATTEMPTS = 3;
+const DEFAULT_PROMPT_RETRY_BACKOFF_MS = 2_000;
+const MAX_PROMPT_RETRY_BACKOFF_MS = 30_000;
+// Keep only the tail of a turn's prose — enough to inspect the final diagnostic.
+const TURN_TEXT_TAIL_LIMIT = 16_384;
+// Hermes wraps Codex, which can exhaust its own internal retries and then surface
+// the failure as an ordinary assistant message while still ending the ACP turn with
+// `end_turn`. Detect that diagnostic so the turn is retried (or reported failed)
+// instead of being misreported as a successful completion with no task summary.
+const TRANSIENT_TURN_FAILURE_RE = /API call failed after \d+ retries:|stream produced no bytes|TTFB threshold/i;
+// Retry nudge: ask the agent to finish from the current state rather than re-running
+// completed work (the original prompt is NOT resent, to avoid duplicate effort).
+const CONTINUATION_PROMPT_BLOCKS: AcpContentBlock[] = [{
+  type: 'text',
+  text:
+    'The previous turn ended with a transient model/transport failure before producing a final response. '
+    + 'Do not redo work that is already complete. Review the current state, finish the task, and end your '
+    + 'final message with the required <task-summary>…</task-summary> block.',
+}];
 const SAFE_ENV_PREFIXES = ['HERMES_'];
 const SAFE_ENV_KEYS = new Set([
   'PATH',
@@ -122,6 +156,8 @@ export class HermesProvider implements AgentProvider {
   private spawnProcess: SpawnHermesProcess;
   private env?: NodeJS.ProcessEnv;
   private requestTimeoutMs: number;
+  private promptRetryAttempts: number;
+  private promptRetryBackoffMs: number;
   private connection: HermesAcpConnection | null = null;
   private sessions = new Map<string, RegisteredSession>();
 
@@ -133,6 +169,14 @@ export class HermesProvider implements AgentProvider {
     this.spawnProcess = options?.spawn ?? defaultSpawn;
     this.env = options?.env;
     this.requestTimeoutMs = options?.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
+    this.promptRetryAttempts = Math.max(
+      1,
+      options?.promptRetryAttempts ?? parseEnvInt(process.env.HERMES_PROMPT_RETRIES, DEFAULT_PROMPT_RETRY_ATTEMPTS),
+    );
+    this.promptRetryBackoffMs = Math.max(
+      0,
+      options?.promptRetryBackoffMs ?? parseEnvInt(process.env.HERMES_PROMPT_RETRY_BACKOFF_MS, DEFAULT_PROMPT_RETRY_BACKOFF_MS),
+    );
   }
 
   async start(): Promise<void> {
@@ -200,6 +244,8 @@ export class HermesProvider implements AgentProvider {
       config,
       destroyed: false,
       aborted: false,
+      turnText: '',
+      sawSummaryTag: false,
     };
     this.sessions.set(hermesSessionId, registered);
 
@@ -311,22 +357,74 @@ export class HermesProvider implements AgentProvider {
     prompt: AcpContentBlock[],
     session: RegisteredSession,
   ): Promise<AgentResult> {
-    const response = await connection.sendRequest(
-      'session/prompt',
-      { sessionId, prompt, messageId: uuid() },
-      PROMPT_REQUEST_TIMEOUT_MS,
-    );
-    const stopReason = getStringProperty(response, 'stopReason') ?? 'end_turn';
-    if (session.aborted || stopReason === 'cancelled') {
-      return { status: 'failed', error: 'Hermes execution aborted' };
+    let lastTransientError = '';
+    for (let attempt = 1; attempt <= this.promptRetryAttempts; attempt++) {
+      // A "turn" is one prompt/response round-trip; reset the per-turn buffers so
+      // transient-failure detection only inspects the latest attempt's output.
+      session.turnText = '';
+      session.sawSummaryTag = false;
+      const blocks = attempt === 1 ? prompt : CONTINUATION_PROMPT_BLOCKS;
+
+      const response = await connection.sendRequest(
+        'session/prompt',
+        { sessionId, prompt: blocks, messageId: uuid() },
+        PROMPT_REQUEST_TIMEOUT_MS,
+      );
+      const stopReason = getStringProperty(response, 'stopReason') ?? 'end_turn';
+      if (session.aborted || stopReason === 'cancelled') {
+        return { status: 'failed', error: 'Hermes execution aborted' };
+      }
+
+      if (stopReason === 'end_turn' && this.isTransientTurnFailure(session)) {
+        lastTransientError = transientFailureText(session) || 'transient model/transport failure';
+        if (attempt < this.promptRetryAttempts) {
+          emitEvent(
+            session.config,
+            'thinking',
+            `Hermes turn ended with a transient failure (attempt ${attempt}/${this.promptRetryAttempts}); retrying: ${lastTransientError}`,
+          );
+          const interrupted = await this.backoff(attempt, session);
+          if (interrupted) {
+            return { status: 'failed', error: 'Hermes execution aborted' };
+          }
+          continue;
+        }
+        const error = `Hermes failed after ${this.promptRetryAttempts} attempt(s): ${lastTransientError}`;
+        emitEvent(session.config, 'error', error);
+        return { status: 'failed', error };
+      }
+
+      if (stopReason === 'end_turn' || stopReason === 'max_tokens' || stopReason === 'max_turn_requests') {
+        emitEvent(session.config, 'complete', 'Hermes completed the task.');
+        return { status: 'complete' };
+      }
+      const error = `Hermes stopped with reason: ${stopReason}`;
+      emitEvent(session.config, 'error', error);
+      return { status: 'failed', error };
     }
-    if (stopReason === 'end_turn' || stopReason === 'max_tokens' || stopReason === 'max_turn_requests') {
-      emitEvent(session.config, 'complete', 'Hermes completed the task.');
-      return { status: 'complete' };
-    }
-    const error = `Hermes stopped with reason: ${stopReason}`;
+    const error = `Hermes failed after ${this.promptRetryAttempts} attempt(s): ${lastTransientError || 'transient model/transport failure'}`;
     emitEvent(session.config, 'error', error);
     return { status: 'failed', error };
+  }
+
+  /**
+   * A turn is a transient failure when it produced no <task-summary> sentinel and
+   * the tail of its output matches a known Codex transport-exhaustion diagnostic.
+   */
+  private isTransientTurnFailure(session: RegisteredSession): boolean {
+    if (session.sawSummaryTag) return false;
+    return TRANSIENT_TURN_FAILURE_RE.test(transientFailureTail(session));
+  }
+
+  /** Abort-aware delay. Returns true if the session was aborted/destroyed during the wait. */
+  private async backoff(attempt: number, session: RegisteredSession): Promise<boolean> {
+    const total = Math.min(this.promptRetryBackoffMs * 2 ** (attempt - 1), MAX_PROMPT_RETRY_BACKOFF_MS);
+    const deadline = Date.now() + total;
+    while (Date.now() < deadline) {
+      if (session.aborted || session.destroyed) return true;
+      await delay(Math.min(250, deadline - Date.now()));
+    }
+    return session.aborted || session.destroyed;
   }
 
   private handleSessionUpdate(sessionId: string, update: AcpUpdate): void {
@@ -337,7 +435,10 @@ export class HermesProvider implements AgentProvider {
     switch (updateKind) {
       case 'agent_message_chunk': {
         const text = extractContentText(update.content);
-        if (text) emitEvent(session.config, 'output', text);
+        if (text) {
+          appendTurnText(session, text);
+          emitEvent(session.config, 'output', text);
+        }
         break;
       }
       case 'agent_thought_chunk': {
@@ -792,6 +893,36 @@ function errorMessage(err: unknown): string {
 
 function isTruthy(value: string | undefined): boolean {
   return ['1', 'true', 'yes', 'on'].includes((value ?? '').toLowerCase());
+}
+
+function parseEnvInt(value: string | undefined, fallback: number): number {
+  if (value === undefined) return fallback;
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, Math.max(0, ms)));
+}
+
+/** Append agent prose to a session's bounded turn buffer and flag any summary sentinel. */
+function appendTurnText(session: { turnText: string; sawSummaryTag: boolean }, text: string): void {
+  const combined = session.turnText + text;
+  session.turnText = combined.length > TURN_TEXT_TAIL_LIMIT
+    ? combined.slice(combined.length - TURN_TEXT_TAIL_LIMIT)
+    : combined;
+  if (text.includes('task-summary')) session.sawSummaryTag = true;
+}
+
+function transientFailureTail(session: { turnText: string }): string {
+  return session.turnText.slice(-500);
+}
+
+function transientFailureText(session: { turnText: string }): string {
+  const tail = transientFailureTail(session);
+  const match = tail.match(TRANSIENT_TURN_FAILURE_RE);
+  if (!match) return tail.trim();
+  return tail.slice(match.index ?? 0).trim();
 }
 
 function undefinedTimer(): NodeJS.Timeout {

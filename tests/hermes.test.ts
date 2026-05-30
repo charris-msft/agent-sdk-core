@@ -454,3 +454,131 @@ describe('HermesProvider ACP sessions', () => {
     assert.equal(unknownResponse?.error?.code, -32601);
   });
 });
+
+describe('HermesProvider transient-failure retries', () => {
+  function sendChunk(process: FakeHermesProcess, sessionId: string, text: string): void {
+    process.send({
+      jsonrpc: '2.0',
+      method: 'session/update',
+      params: {
+        sessionId,
+        update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text } },
+      },
+    });
+  }
+
+  it('should retry a transient end_turn failure and then complete', async () => {
+    const promptBlocks: Array<Array<{ type: string; text?: string }>> = [];
+    let promptCount = 0;
+    const fake = new FakeHermesProcess((message, process) => {
+      if (respondToInitialize(message, process)) return;
+      if (message.method === 'session/new') {
+        process.respond(message, { sessionId: 'sess-retry' });
+        return;
+      }
+      if (message.method === 'session/prompt') {
+        promptCount++;
+        promptBlocks.push(message.params?.prompt as Array<{ type: string; text?: string }>);
+        if (promptCount === 1) {
+          sendChunk(process, 'sess-retry', 'API call failed after 3 retries: Codex stream produced no bytes within 12s (TTFB threshold: 12s)');
+        } else {
+          sendChunk(process, 'sess-retry', 'All done. <task-summary>Implemented the change.</task-summary>');
+        }
+        process.respond(message, { stopReason: 'end_turn' });
+      }
+    });
+    const provider = new HermesProvider({ command: 'hermes', spawn: () => fake as never, promptRetryBackoffMs: 0 });
+    await provider.start();
+
+    const { events, onEvent } = collectEvents();
+    const session = await provider.createSession({
+      contextId: 'ctx-1',
+      workingDirectory: '/tmp/project',
+      systemPrompt: 'system prompt',
+      onEvent,
+    });
+
+    const result = await session.execute('do the work');
+
+    assert.equal(result.status, 'complete');
+    assert.equal(promptCount, 2);
+    // First attempt sends the original prompt; the retry sends only a continuation nudge.
+    assert.ok(promptBlocks[0].some(block => block.text?.includes('do the work')));
+    assert.ok(promptBlocks[1].some(block => block.text?.includes('transient')));
+    assert.ok(!promptBlocks[1].some(block => block.text?.includes('do the work')));
+    assert.ok(events.some(event => event.type === 'thinking' && event.content.includes('retrying')));
+    assert.ok(events.some(event => event.type === 'complete'));
+  });
+
+  it('should fail after exhausting transient retries', async () => {
+    let promptCount = 0;
+    const fake = new FakeHermesProcess((message, process) => {
+      if (respondToInitialize(message, process)) return;
+      if (message.method === 'session/new') {
+        process.respond(message, { sessionId: 'sess-exhaust' });
+        return;
+      }
+      if (message.method === 'session/prompt') {
+        promptCount++;
+        sendChunk(process, 'sess-exhaust', 'API call failed after 3 retries: stream produced no bytes');
+        process.respond(message, { stopReason: 'end_turn' });
+      }
+    });
+    const provider = new HermesProvider({
+      command: 'hermes',
+      spawn: () => fake as never,
+      promptRetryAttempts: 2,
+      promptRetryBackoffMs: 0,
+    });
+    await provider.start();
+
+    const { events, onEvent } = collectEvents();
+    const session = await provider.createSession({
+      contextId: 'ctx-1',
+      workingDirectory: '/tmp/project',
+      systemPrompt: '',
+      onEvent,
+    });
+
+    const result = await session.execute('do the work');
+
+    assert.equal(result.status, 'failed');
+    assert.equal(promptCount, 2);
+    assert.match(result.error ?? '', /after 2 attempt/);
+    assert.ok(events.some(event => event.type === 'error'));
+  });
+
+  it('should not retry when the turn produced a task-summary that mentions a failure', async () => {
+    let promptCount = 0;
+    const fake = new FakeHermesProcess((message, process) => {
+      if (respondToInitialize(message, process)) return;
+      if (message.method === 'session/new') {
+        process.respond(message, { sessionId: 'sess-summary' });
+        return;
+      }
+      if (message.method === 'session/prompt') {
+        promptCount++;
+        sendChunk(
+          process,
+          'sess-summary',
+          '<task-summary>Recovered after an API call failed after 3 retries earlier; task is complete.</task-summary>',
+        );
+        process.respond(message, { stopReason: 'end_turn' });
+      }
+    });
+    const provider = new HermesProvider({ command: 'hermes', spawn: () => fake as never, promptRetryBackoffMs: 0 });
+    await provider.start();
+
+    const session = await provider.createSession({
+      contextId: 'ctx-1',
+      workingDirectory: '/tmp/project',
+      systemPrompt: '',
+      onEvent: () => {},
+    });
+
+    const result = await session.execute('do the work');
+
+    assert.equal(result.status, 'complete');
+    assert.equal(promptCount, 1);
+  });
+});
